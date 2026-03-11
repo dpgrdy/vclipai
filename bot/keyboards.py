@@ -36,6 +36,21 @@ VIDEO = IKM(inline_keyboard=[
 TOOLS = IKM(inline_keyboard=[
     [_b("🗑 Убрать фон · 1⭐", "tool:rmbg")],
     [_b("🔍 Улучшить качество 2x · 1⭐", "tool:upscale")],
+    [_b("⚪ Редактировать кружок · 1⭐", "tool:circle")],
+    [_b("◀️ Назад", "nav:main")],
+])
+
+# ━━━━━━━━━━━━ CIRCLE EFFECTS ━━━━━━━━━━━━
+
+CIRCLE_EFFECTS = IKM(inline_keyboard=[
+    [_b("🌑 Ч/Б", "ceff:bw"),
+     _b("🔥 Тёплый", "ceff:warm"),
+     _b("❄️ Холодный", "ceff:cool")],
+    [_b("📽 Винтаж", "ceff:vintage"),
+     _b("✨ Чёткость+", "ceff:sharp")],
+    [_b("⏩ Ускорить 2x", "ceff:speed2x"),
+     _b("🐌 Замедлить", "ceff:slow")],
+    [_b("⏪ Реверс", "ceff:reverse")],
     [_b("◀️ Назад", "nav:main")],
 ])
 

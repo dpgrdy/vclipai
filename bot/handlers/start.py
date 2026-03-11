@@ -13,7 +13,7 @@ from aiogram.fsm.context import FSMContext
 import bot.keyboards as kb
 from bot.states import (
     GenImage, EditPhoto, StyleTransfer, RemoveBG, Upscale,
-    GenVideo, ImgToVideo, PromoRedeem,
+    GenVideo, ImgToVideo, EditCircle, PromoRedeem,
     AdminBroadcast, AdminUser, AdminGrant, AdminBan, AdminPromo,
 )
 from bot.services.notifier import notify
@@ -42,14 +42,14 @@ MODEL_NAMES = {
 }
 TOOL_COST = {
     "tool:gen": 1, "tool:edit": 1, "tool:style": 1,
-    "tool:rmbg": 1, "tool:upscale": 1,
+    "tool:rmbg": 1, "tool:upscale": 1, "tool:circle": 1,
     "tool:vid_text": 5, "tool:vid_img": 5,
 }
 TOOL_NAMES = {
     "tool:gen": "Генерация", "tool:edit": "Редактирование",
     "tool:style": "Стиль", "tool:rmbg": "Удаление фона",
-    "tool:upscale": "Апскейл", "tool:vid_text": "Текст→Видео",
-    "tool:vid_img": "Фото→Видео",
+    "tool:upscale": "Апскейл", "tool:circle": "Кружок",
+    "tool:vid_text": "Текст→Видео", "tool:vid_img": "Фото→Видео",
 }
 
 
@@ -277,6 +277,16 @@ async def t_vid_img(cb: CallbackQuery, state: FSMContext):
         "· лёгкий ветер шевелит волосы\n"
         "· zoom in на лицо</i>"
     ), kb.BACK)
+
+@router.callback_query(F.data == "tool:circle")
+async def t_circle(cb: CallbackQuery, state: FSMContext):
+    if not await _check_balance(cb, TOOL_COST["tool:circle"]):
+        return
+    await _ed(cb, (
+        "⚪ <b>Редактировать кружок</b>  ·  1⭐\n\n"
+        "Выбери эффект, затем отправь кружок.\n"
+        "Получишь обработанный кружок обратно!"
+    ), kb.CIRCLE_EFFECTS)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -910,6 +920,7 @@ def _welcome(u: dict) -> str:
         f"{greeting}\n\n"
         f"🖼 Генерация и редактирование фото\n"
         f"🎥 Создание видео из текста и фото\n"
+        f"⚪ Редактирование кружков с эффектами\n"
         f"🛠 Удаление фона, апскейл и другое\n\n"
         f"💰 Баланс: <b>{u['balance']}⭐</b>\n"
         f"🎟 Есть промокод? → /promo КОД"

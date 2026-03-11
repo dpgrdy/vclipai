@@ -13,7 +13,7 @@ from aiogram.types import Message, BotCommand
 
 from config import settings
 from db import init_db, is_banned, touch_user
-from bot.handlers import start, generate, edit_photo, remove_bg, upscale, video_gen
+from bot.handlers import start, generate, edit_photo, remove_bg, upscale, video_gen, circle
 from bot.services import notifier
 import bot.keyboards as kb
 
@@ -132,6 +132,7 @@ async def main():
     dp.include_router(remove_bg.router)
     dp.include_router(upscale.router)
     dp.include_router(video_gen.router)
+    dp.include_router(circle.router)
     dp.include_router(fallback_router)
 
     log.info("VClipAI bot starting...")

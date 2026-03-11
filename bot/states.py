@@ -29,6 +29,10 @@ class ImgToVideo(StatesGroup):
     waiting_photo = State()
 
 
+class EditCircle(StatesGroup):
+    waiting_video = State()
+
+
 class PromoRedeem(StatesGroup):
     waiting_code = State()
 
