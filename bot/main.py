@@ -12,8 +12,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, BotCommand
 
 from config import settings
-from db import init_db
-from bot.handlers import start, montage, generate, edit_photo, remove_bg, upscale, video_gen
+from db import init_db, is_banned, touch_user
+from bot.handlers import start, generate, edit_photo, remove_bg, upscale, video_gen
+from bot.services import notifier
 import bot.keyboards as kb
 
 logging.basicConfig(
@@ -25,8 +26,6 @@ log = logging.getLogger(__name__)
 
 
 class _LocalFilesWrapper(FilesPathWrapper):
-    """Map container paths to host bind mount, handling ':' → fullwidth colon on Windows."""
-
     SERVER_ROOT = "/var/lib/telegram-bot-api"
 
     def __init__(self, local_data: Path) -> None:
@@ -36,7 +35,6 @@ class _LocalFilesWrapper(FilesPathWrapper):
         s = str(path)
         if s.startswith(self.SERVER_ROOT):
             rel = s[len(self.SERVER_ROOT):].lstrip("/")
-            # Docker bind mount on Windows maps ':' to fullwidth colon U+F03A
             if sys.platform == "win32":
                 rel = rel.replace(":", "\uf03a")
             return self.local_data / rel
@@ -64,7 +62,7 @@ def create_bot() -> Bot:
     )
 
 
-# Fallback router — catches everything not handled above
+# Fallback router
 fallback_router = Router()
 
 
@@ -79,26 +77,17 @@ async def fallback_photo(message: Message):
 
 @fallback_router.message(F.sticker)
 async def fallback_sticker(message: Message):
-    await message.answer(
-        "Выбери инструмент в меню 👇",
-        reply_markup=kb.BACK,
-    )
+    await message.answer("Выбери инструмент в меню 👇", reply_markup=kb.BACK)
 
 
 @fallback_router.message(F.text)
 async def fallback_text(message: Message):
-    await message.answer(
-        "Используй меню для навигации 👇",
-        reply_markup=kb.BACK,
-    )
+    await message.answer("Используй меню для навигации 👇", reply_markup=kb.BACK)
 
 
 @fallback_router.message()
 async def fallback_any(message: Message):
-    await message.answer(
-        "Используй меню 👇",
-        reply_markup=kb.BACK,
-    )
+    await message.answer("Используй меню 👇", reply_markup=kb.BACK)
 
 
 async def main():
@@ -107,20 +96,43 @@ async def main():
     bot = create_bot()
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Set bot commands (blue menu button in TG)
+    # Init notifier
+    admin_ids = (
+        {int(x) for x in settings.admin_ids.split(",") if x.strip()}
+        if settings.admin_ids else set()
+    )
+    notifier.init(bot, admin_ids)
+
+    # Ban middleware
+    @dp.message.outer_middleware()
+    async def ban_check(handler, event: Message, data):
+        if event.from_user and await is_banned(event.from_user.id):
+            await event.answer("🚫 Доступ заблокирован.")
+            return
+        if event.from_user:
+            await touch_user(event.from_user.id)
+        return await handler(event, data)
+
+    @dp.callback_query.outer_middleware()
+    async def ban_check_cb(handler, event, data):
+        if event.from_user and await is_banned(event.from_user.id):
+            await event.answer("🚫 Доступ заблокирован.", show_alert=True)
+            return
+        return await handler(event, data)
+
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="promo", description="Активировать промокод"),
     ])
 
-    # Order matters: start first (nav + callbacks), then feature handlers, fallback last
+    # Routers
     dp.include_router(start.router)
     dp.include_router(generate.router)
     dp.include_router(edit_photo.router)
     dp.include_router(remove_bg.router)
     dp.include_router(upscale.router)
     dp.include_router(video_gen.router)
-    dp.include_router(montage.router)      # catches F.video + video F.document
-    dp.include_router(fallback_router)      # catches everything else
+    dp.include_router(fallback_router)
 
     log.info("VClipAI bot starting...")
     await dp.start_polling(bot)

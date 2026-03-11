@@ -29,18 +29,13 @@ class ImgToVideo(StatesGroup):
     waiting_photo = State()
 
 
-class MontageFlow(StatesGroup):
-    waiting_video = State()
-    analyzing = State()
-    configure = State()
-    waiting_music = State()
-    processing = State()
+class PromoRedeem(StatesGroup):
+    waiting_code = State()
 
 
 # Admin
 class AdminBroadcast(StatesGroup):
     waiting_text = State()
-    confirm = State()
 
 
 class AdminUser(StatesGroup):
@@ -50,3 +45,13 @@ class AdminUser(StatesGroup):
 class AdminGrant(StatesGroup):
     waiting_id = State()
     waiting_amount = State()
+
+
+class AdminBan(StatesGroup):
+    waiting_id = State()
+
+
+class AdminPromo(StatesGroup):
+    waiting_code = State()
+    waiting_stars = State()
+    waiting_uses = State()

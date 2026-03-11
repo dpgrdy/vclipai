@@ -12,6 +12,7 @@ from bot.keyboards import BACK, LOW_BALANCE, result_kb
 from bot.progress import Progress
 from db import get_balance, spend, topup, get_model
 from core.image_gen import edit_image
+from bot.services.notifier import notify
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -60,6 +61,8 @@ async def _process_photo(message: Message, state: FSMContext, bot: Bot, label: s
         await state.clear()
         return
 
+    tool_name = "edit" if "✏" in label else "style"
+    await notify("tool_use", f"{label} {caption[:50]}", tg_id=tg_id, tool=tool_name)
     bal = await get_balance(tg_id)
     size_kb = len(result) / 1024
     await bot.send_photo(

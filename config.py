@@ -16,7 +16,8 @@ class Settings(BaseSettings):
 
     temp_dir: Path = Path("./temp")
     max_video_size_mb: int = 2000
-    max_video_duration: int = 600  # seconds
+    max_video_duration: int = 600
+    daily_free_limit: int = 50
 
     class Config:
         env_file = ".env"

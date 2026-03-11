@@ -12,6 +12,7 @@ from bot.keyboards import BACK, LOW_BALANCE, result_kb
 from bot.progress import Progress
 from db import get_balance, spend, topup, get_model
 from core.image_gen import generate_image
+from bot.services.notifier import notify
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ async def on_prompt(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return
 
+    await notify("tool_use", f"Генерация: {prompt[:50]}", tg_id=tg_id, tool="gen")
     photo = BufferedInputFile(result, filename="generated.png")
     bal = await get_balance(tg_id)
     size_kb = len(result) / 1024

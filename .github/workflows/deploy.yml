@@ -16,12 +16,19 @@ jobs:
           password: ${{ secrets.SSH_PASSWORD }}
           script: |
             set -e
-            cd /opt/vclipai
+            cd /opt/vclipai || {
+              echo "First deploy — cloning..."
+              git clone https://github.com/dpgrdy/vclipai.git /opt/vclipai
+              cd /opt/vclipai
+            }
 
             # Pull latest code
             git pull origin master
 
-            # Rebuild and restart
+            # Ensure directories
+            mkdir -p temp data bot-api-data
+
+            # Build and restart
             docker compose up -d --build
 
             # Show status

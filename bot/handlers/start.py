@@ -1,4 +1,4 @@
-"""Navigation hub — menu, categories, tools, profile, payments, settings, admin."""
+"""Navigation hub — menu, profile, payments, referral, promos, admin."""
 
 import html
 import logging
@@ -13,13 +13,17 @@ from aiogram.fsm.context import FSMContext
 import bot.keyboards as kb
 from bot.states import (
     GenImage, EditPhoto, StyleTransfer, RemoveBG, Upscale,
-    GenVideo, ImgToVideo,
-    AdminBroadcast, AdminUser, AdminGrant,
+    GenVideo, ImgToVideo, PromoRedeem,
+    AdminBroadcast, AdminUser, AdminGrant, AdminBan, AdminPromo,
 )
+from bot.services.notifier import notify
 from db import (
     get_or_create_user, get_user, get_balance, topup, get_model, set_model,
-    get_referral_count, get_history, get_stats, get_all_user_ids,
-    find_user_by_id, grant_balance,
+    get_referral_count, get_referral_earnings, get_history, get_stats,
+    get_all_user_ids, find_user_by_id, grant_balance,
+    is_banned, ban_user, redeem_promo, create_promo, get_promos,
+    get_notify_settings, toggle_notify, get_recent_logs, get_top_referrers,
+    check_daily_limit,
 )
 from config import settings
 
@@ -36,12 +40,16 @@ MODEL_NAMES = {
     "gemini_pro": "Gemini Pro 🧠",
     "flux": "Flux 🎨",
 }
-# cost per tool for balance pre-check
 TOOL_COST = {
     "tool:gen": 1, "tool:edit": 1, "tool:style": 1,
     "tool:rmbg": 1, "tool:upscale": 1,
     "tool:vid_text": 5, "tool:vid_img": 5,
-    "tool:clip": 3,
+}
+TOOL_NAMES = {
+    "tool:gen": "Генерация", "tool:edit": "Редактирование",
+    "tool:style": "Стиль", "tool:rmbg": "Удаление фона",
+    "tool:upscale": "Апскейл", "tool:vid_text": "Текст→Видео",
+    "tool:vid_img": "Фото→Видео",
 }
 
 
@@ -69,6 +77,16 @@ async def cmd_start(message: Message, state: FSMContext):
         message.from_user.first_name or "",
         ref,
     )
+
+    # Notify admin about new users
+    if user.get("balance") == 5 and user.get("total_gens") == 0:
+        name = html.escape(user.get("first_name") or "")
+        await notify("new_user",
+                      f"<b>{name}</b> (@{user.get('username', '?')})\n"
+                      f"ID: <code>{user['tg_id']}</code>\n"
+                      f"Реферер: {ref or 'organic'}",
+                      tg_id=user["tg_id"])
+
     await message.answer(_welcome(user), reply_markup=kb.MAIN)
 
 
@@ -78,6 +96,27 @@ async def cmd_admin(message: Message):
         return
     s = await get_stats()
     await message.answer(_admin_text(s), reply_markup=kb.ADMIN)
+
+
+@router.message(Command("promo"))
+async def cmd_promo(message: Message, state: FSMContext):
+    args = message.text.split()
+    if len(args) > 1:
+        code = args[1].strip()
+        ok, msg = await redeem_promo(message.from_user.id, code)
+        if ok:
+            bal = await get_balance(message.from_user.id)
+            await notify("promo", f"Промокод {code} активирован",
+                         tg_id=message.from_user.id, tool="promo")
+            await message.answer(
+                f"✅ <b>{msg}</b>\n💰 Баланс: <b>{bal}⭐</b>",
+                reply_markup=kb.BACK)
+        else:
+            await message.answer(f"❌ {msg}", reply_markup=kb.BACK)
+    else:
+        await state.set_state(PromoRedeem.waiting_code)
+        await message.answer(
+            "🎟 <b>Введи промокод:</b>", reply_markup=kb.CANCEL)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -125,15 +164,22 @@ async def cat_tools(cb: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 
 async def _check_balance(cb: CallbackQuery, cost: int) -> bool:
-    """Check balance and show topup prompt if insufficient. Returns True if OK."""
     bal = await get_balance(cb.from_user.id)
     if bal < cost:
         await _ed(cb, (
             f"❌ <b>Недостаточно звёзд</b>\n\n"
-            f"Нужно: <b>{cost}⭐</b>\n"
-            f"Баланс: <b>{bal}⭐</b>\n\n"
-            f"Пополни баланс и попробуй снова."
+            f"Нужно: <b>{cost}⭐</b>, у тебя: <b>{bal}⭐</b>\n\n"
+            f"Пополни баланс или пригласи друга (+3⭐)."
         ), kb.LOW_BALANCE)
+        return False
+    # Daily limit check
+    ok, remaining = await check_daily_limit(cb.from_user.id, settings.daily_free_limit)
+    if not ok:
+        await _ed(cb, (
+            f"⏳ <b>Дневной лимит исчерпан</b>\n\n"
+            f"Максимум {settings.daily_free_limit} операций в день.\n"
+            f"Попробуй завтра!"
+        ), kb.BACK)
         return False
     return True
 
@@ -146,7 +192,10 @@ async def t_gen(cb: CallbackQuery, state: FSMContext):
     await _ed(cb, (
         "🎨 <b>Создать изображение</b>  ·  1⭐\n\n"
         "Напиши текстовое описание того, что хочешь увидеть.\n\n"
-        "<i>Пример: киберпанк город ночью, неоновые вывески, дождь</i>"
+        "<i>Примеры:\n"
+        "· киберпанк город ночью, неоновые вывески\n"
+        "· милый котёнок в космосе\n"
+        "· логотип для кофейни в минималистичном стиле</i>"
     ), kb.BACK)
 
 @router.callback_query(F.data == "tool:edit")
@@ -157,7 +206,10 @@ async def t_edit(cb: CallbackQuery, state: FSMContext):
     await _ed(cb, (
         "✏️ <b>Редактировать фото</b>  ·  1⭐\n\n"
         "Отправь фото и в подписи напиши, что изменить.\n\n"
-        "<i>Пример: сделай фон закатным</i>"
+        "<i>Примеры:\n"
+        "· сделай фон закатным\n"
+        "· убери текст с картинки\n"
+        "· добавь снег</i>"
     ), kb.BACK)
 
 @router.callback_query(F.data == "tool:style")
@@ -172,7 +224,8 @@ async def t_style(cb: CallbackQuery, state: FSMContext):
         "· в стиле аниме\n"
         "· в стиле Ван Гога\n"
         "· pixel art\n"
-        "· 3D рендер</i>"
+        "· 3D рендер\n"
+        "· комикс</i>"
     ), kb.BACK)
 
 @router.callback_query(F.data == "tool:rmbg")
@@ -182,7 +235,8 @@ async def t_rmbg(cb: CallbackQuery, state: FSMContext):
     await state.set_state(RemoveBG.waiting_photo)
     await _ed(cb, (
         "🗑 <b>Убрать фон</b>  ·  1⭐\n\n"
-        "Отправь фото — получишь PNG с прозрачным фоном."
+        "Отправь фото — получишь PNG с прозрачным фоном.\n"
+        "Подходит для стикеров, логотипов, товаров."
     ), kb.BACK)
 
 @router.callback_query(F.data == "tool:upscale")
@@ -192,23 +246,8 @@ async def t_upscale(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Upscale.waiting_photo)
     await _ed(cb, (
         "🔍 <b>Улучшить качество 2x</b>  ·  1⭐\n\n"
-        "Отправь фото — увеличу разрешение в 2 раза и улучшу резкость."
-    ), kb.BACK)
-
-@router.callback_query(F.data == "tool:clip")
-async def t_clip(cb: CallbackQuery):
-    if not await _check_balance(cb, TOOL_COST["tool:clip"]):
-        return
-    await _ed(cb, (
-        "🎬 <b>AI-монтаж клипа</b>  ·  3⭐\n\n"
-        "Отправь видео геймплея и в подписи напиши,\n"
-        "что нужно нарезать.\n\n"
-        "AI найдёт нужные моменты, добавит эффекты\n"
-        "и соберёт готовый клип для TikTok.\n\n"
-        "<i>Примеры:\n"
-        "· нарежь моменты попаданий\n"
-        "· собери все килы\n"
-        "· лучшие моменты</i>"
+        "Отправь фото — увеличу разрешение в 2 раза\n"
+        "и улучшу резкость."
     ), kb.BACK)
 
 @router.callback_query(F.data == "tool:vid_text")
@@ -219,7 +258,10 @@ async def t_vid_text(cb: CallbackQuery, state: FSMContext):
     await _ed(cb, (
         "📝 <b>Текст → Видео</b>  ·  5⭐\n\n"
         "Опиши видео, которое хочешь получить.\n\n"
-        "<i>Пример: котёнок играет с клубком на фоне тёплого света</i>"
+        "<i>Примеры:\n"
+        "· котёнок играет с клубком на фоне тёплого света\n"
+        "· закат над океаном, волны, чайки\n"
+        "· машина едет по ночному городу</i>"
     ), kb.BACK)
 
 @router.callback_query(F.data == "tool:vid_img")
@@ -230,7 +272,10 @@ async def t_vid_img(cb: CallbackQuery, state: FSMContext):
     await _ed(cb, (
         "🖼 <b>Фото → Видео</b>  ·  5⭐\n\n"
         "Отправь фото и в подписи опиши движение.\n\n"
-        "<i>Пример: камера медленно облетает вокруг</i>"
+        "<i>Примеры:\n"
+        "· камера медленно облетает вокруг\n"
+        "· лёгкий ветер шевелит волосы\n"
+        "· zoom in на лицо</i>"
     ), kb.BACK)
 
 
@@ -245,12 +290,14 @@ async def p_profile(cb: CallbackQuery):
         await cb.answer("Нажми /start")
         return
     model = MODEL_NAMES.get(u["model"], u["model"])
+    ref_count = await get_referral_count(cb.from_user.id)
     await _ed(cb, (
         f"👤 <b>Профиль</b>\n\n"
-        f"💰 Баланс: <b>{u['balance']} ⭐</b>\n"
+        f"💰 Баланс: <b>{u['balance']}⭐</b>\n"
         f"🎯 Генераций: <b>{u['total_gens']}</b>\n"
-        f"💸 Потрачено: <b>{u['total_spent']} ⭐</b>\n"
+        f"💸 Потрачено: <b>{u['total_spent']}⭐</b>\n"
         f"🤖 Модель: <b>{model}</b>\n"
+        f"👥 Рефералов: <b>{ref_count}</b>\n"
         f"📅 С нами с {str(u['created_at'])[:10]}"
     ), kb.PROFILE)
 
@@ -273,16 +320,51 @@ async def p_history(cb: CallbackQuery):
 async def p_referral(cb: CallbackQuery, bot: Bot):
     tid = cb.from_user.id
     cnt = await get_referral_count(tid)
+    earnings = await get_referral_earnings(tid)
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start=ref{tid}"
+
+    # Calculate current tier
+    base_bonus = min(3 + cnt // 5, 10)
+
     await _ed(cb, (
         f"🤝 <b>Реферальная программа</b>\n\n"
-        f"Приглашай друзей — получай <b>+3⭐</b> за каждого!\n"
-        f"Друг тоже получит <b>10⭐</b> при регистрации.\n\n"
+        f"Приглашай друзей и получай звёзды!\n\n"
+        f"<b>Бонусы за приглашение:</b>\n"
+        f"· Базовый: <b>+3⭐</b> за каждого друга\n"
+        f"· За каждые 5 рефералов бонус растёт на +1⭐\n"
+        f"· Максимум: <b>+10⭐</b> за друга\n"
+        f"· Друг получает <b>5⭐</b> при регистрации\n\n"
+        f"Сейчас за друга: <b>+{base_bonus}⭐</b>\n\n"
         f"Твоя ссылка:\n<code>{link}</code>\n\n"
         f"👥 Приглашено: <b>{cnt}</b>\n"
-        f"💰 Заработано: <b>{cnt * 3} ⭐</b>"
+        f"💰 Заработано: <b>{earnings}⭐</b>"
     ), kb.BACK_TO_PROFILE)
+
+
+@router.callback_query(F.data == "p:promo")
+async def p_promo(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(PromoRedeem.waiting_code)
+    await _ed(cb, (
+        "🎟 <b>Промокод</b>\n\n"
+        "Введи промокод для получения бонусных звёзд:"
+    ), kb.CANCEL)
+
+
+@router.message(PromoRedeem.waiting_code, F.text)
+async def promo_redeem(message: Message, state: FSMContext):
+    code = message.text.strip()
+    ok, msg = await redeem_promo(message.from_user.id, code)
+    if ok:
+        bal = await get_balance(message.from_user.id)
+        await notify("promo", f"Промокод <b>{code}</b> активирован\nUser: {message.from_user.id}",
+                     tg_id=message.from_user.id, tool="promo")
+        await message.answer(
+            f"✅ <b>{msg}</b>\n💰 Баланс: <b>{bal}⭐</b>",
+            reply_markup=kb.BACK)
+    else:
+        await message.answer(f"❌ {msg}", reply_markup=kb.BACK)
+    await state.clear()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -294,7 +376,7 @@ async def p_topup(cb: CallbackQuery):
     bal = await get_balance(cb.from_user.id)
     await _ed(cb, (
         f"💰 <b>Пополнение баланса</b>\n\n"
-        f"Текущий баланс: <b>{bal} ⭐</b>\n\n"
+        f"Текущий баланс: <b>{bal}⭐</b>\n\n"
         f"Выбери способ оплаты:"
     ), kb.TOPUP_METHOD)
 
@@ -303,7 +385,7 @@ async def p_topup(cb: CallbackQuery):
 async def pay_stars_menu(cb: CallbackQuery):
     await _ed(cb, (
         "⭐ <b>Telegram Stars</b>\n\n"
-        "Оплата через встроенные Telegram Stars.\n"
+        "Мгновенная оплата через Telegram.\n"
         "Выбери пакет:"
     ), kb.TOPUP_STARS)
 
@@ -399,10 +481,12 @@ async def pay_verify(cb: CallbackQuery):
         tid, amt = int(parts[0]), int(parts[1])
         await topup(tid, amt, f"CryptoBot: +{amt}⭐")
         bal = await get_balance(tid)
+        await notify("payment", f"CryptoBot +{amt}⭐ (${CRYPTO_USD.get(amt, '?')})\nUser: {tid}",
+                     tg_id=tid, tool="payment")
         await cb.message.edit_text(
             f"✅ <b>Оплата прошла!</b>\n\n"
             f"+{amt}⭐ зачислено\n"
-            f"💰 Баланс: <b>{bal} ⭐</b>",
+            f"💰 Баланс: <b>{bal}⭐</b>",
             reply_markup=kb.BACK,
         )
     await cb.answer("✅ Готово!")
@@ -418,10 +502,12 @@ async def on_paid(msg: Message):
     amt = int(msg.successful_payment.invoice_payload.split("_")[1])
     await topup(msg.from_user.id, amt, f"Stars: +{amt}⭐")
     bal = await get_balance(msg.from_user.id)
+    await notify("payment", f"TG Stars +{amt}⭐\nUser: {msg.from_user.id}",
+                 tg_id=msg.from_user.id, tool="payment")
     await msg.answer(
         f"✅ <b>Оплата прошла!</b>\n\n"
         f"+{amt}⭐ зачислено\n"
-        f"💰 Баланс: <b>{bal} ⭐</b>",
+        f"💰 Баланс: <b>{bal}⭐</b>",
         reply_markup=kb.BACK,
     )
 
@@ -436,9 +522,9 @@ async def p_settings(cb: CallbackQuery):
     await _ed(cb, (
         "⚙️ <b>Модель генерации</b>\n\n"
         "Выбери AI-модель для создания изображений:\n\n"
-        "• <b>Gemini Flash</b> — быстрая, хорошее качество\n"
-        "• <b>Gemini Pro</b> — лучшее качество, медленнее\n"
-        "• <b>Flux</b> — фотореализм, детали"
+        "· <b>Gemini Flash</b> — быстрая, хорошее качество\n"
+        "· <b>Gemini Pro</b> — лучшее качество, медленнее\n"
+        "· <b>Flux</b> — фотореализм, детали"
     ), kb.settings_kb(m))
 
 
@@ -458,12 +544,39 @@ def _is_admin(tg_id: int) -> bool:
     return tg_id in ADMIN_IDS
 
 
+@router.callback_query(F.data == "adm:panel")
+async def adm_panel(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        return
+    s = await get_stats()
+    await _ed(cb, _admin_text(s), kb.ADMIN)
+
+
 @router.callback_query(F.data == "adm:stats")
 async def adm_stats(cb: CallbackQuery):
     if not _is_admin(cb.from_user.id):
         return
     s = await get_stats()
     await _ed(cb, _admin_text(s), kb.ADMIN)
+
+
+@router.callback_query(F.data == "adm:logs")
+async def adm_logs(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        return
+    logs = await get_recent_logs(20)
+    if not logs:
+        await _ed(cb, "📋 <b>Логи</b>\n\nПока пусто.", kb.ADMIN_BACK)
+        return
+    lines = ["📋 <b>Последние события</b>\n"]
+    for l in logs:
+        ts = str(l["created_at"])[11:16] if l["created_at"] else "?"
+        evt_icon = {"new_user": "👤", "payment": "💰", "tool_use": "🔧",
+                     "error": "❌", "referral": "🤝", "promo": "🎟"}.get(l["event"], "📌")
+        tool_str = f" [{l['tool']}]" if l.get("tool") else ""
+        det = (l.get("details") or "")[:60]
+        lines.append(f"{evt_icon} {ts} · {l['tg_id']}{tool_str} {det}")
+    await _ed(cb, "\n".join(lines), kb.ADMIN_BACK)
 
 
 @router.callback_query(F.data == "adm:broadcast")
@@ -510,10 +623,7 @@ async def adm_user(cb: CallbackQuery, state: FSMContext):
     if not _is_admin(cb.from_user.id):
         return
     await state.set_state(AdminUser.waiting_id)
-    await _ed(cb, (
-        "👤 <b>Поиск пользователя</b>\n\n"
-        "Отправь Telegram ID пользователя:"
-    ), kb.CANCEL)
+    await _ed(cb, "👤 <b>Поиск пользователя</b>\n\nОтправь Telegram ID:", kb.CANCEL)
 
 
 @router.message(AdminUser.waiting_id, F.text)
@@ -521,32 +631,17 @@ async def adm_user_search(message: Message, state: FSMContext):
     if not _is_admin(message.from_user.id):
         await state.clear()
         return
-
     try:
         tid = int(message.text.strip())
     except ValueError:
         await message.answer("❌ Введи числовой ID.")
         return
-
     u = await find_user_by_id(tid)
     if not u:
         await message.answer("❌ Пользователь не найден.", reply_markup=kb.ADMIN)
         await state.clear()
         return
-
-    name = html.escape(u.get("first_name") or "")
-    uname = html.escape(u.get("username") or "-")
-    await message.answer(
-        f"👤 <b>Пользователь</b>\n\n"
-        f"ID: <code>{u['tg_id']}</code>\n"
-        f"Имя: {name}\n"
-        f"Username: @{uname}\n"
-        f"💰 Баланс: <b>{u['balance']} ⭐</b>\n"
-        f"🎯 Генераций: {u['total_gens']}\n"
-        f"💸 Потрачено: {u['total_spent']} ⭐\n"
-        f"📅 Регистрация: {str(u['created_at'])[:10]}",
-        reply_markup=kb.ADMIN,
-    )
+    await message.answer(_user_card(u), reply_markup=kb.user_card_kb(tid, bool(u.get("is_banned"))))
     await state.clear()
 
 
@@ -555,10 +650,7 @@ async def adm_grant(cb: CallbackQuery, state: FSMContext):
     if not _is_admin(cb.from_user.id):
         return
     await state.set_state(AdminGrant.waiting_id)
-    await _ed(cb, (
-        "💰 <b>Начислить баланс</b>\n\n"
-        "Отправь Telegram ID пользователя:"
-    ), kb.CANCEL)
+    await _ed(cb, "💰 <b>Начислить баланс</b>\n\nОтправь Telegram ID:", kb.CANCEL)
 
 
 @router.message(AdminGrant.waiting_id, F.text)
@@ -566,27 +658,33 @@ async def adm_grant_id(message: Message, state: FSMContext):
     if not _is_admin(message.from_user.id):
         await state.clear()
         return
-
     try:
         tid = int(message.text.strip())
     except ValueError:
         await message.answer("❌ Введи числовой ID.")
         return
-
     u = await find_user_by_id(tid)
     if not u:
         await message.answer("❌ Пользователь не найден.", reply_markup=kb.ADMIN)
         await state.clear()
         return
-
     await state.update_data(target_id=tid)
     await state.set_state(AdminGrant.waiting_amount)
     name = html.escape(u.get("first_name") or str(tid))
     await message.answer(
-        f"Пользователь: <b>{name}</b> (баланс: {u['balance']}⭐)\n\n"
-        f"Сколько звёзд начислить?",
+        f"Пользователь: <b>{name}</b> (баланс: {u['balance']}⭐)\n\nСколько звёзд начислить?",
         reply_markup=kb.CANCEL,
     )
+
+
+@router.callback_query(F.data.startswith("adm:gr:"))
+async def adm_grant_quick(cb: CallbackQuery, state: FSMContext):
+    if not _is_admin(cb.from_user.id):
+        return
+    tid = int(cb.data.split(":")[2])
+    await state.update_data(target_id=tid)
+    await state.set_state(AdminGrant.waiting_amount)
+    await _ed(cb, f"💰 Сколько звёзд начислить юзеру {tid}?", kb.CANCEL)
 
 
 @router.message(AdminGrant.waiting_amount, F.text)
@@ -594,7 +692,6 @@ async def adm_grant_amount(message: Message, state: FSMContext):
     if not _is_admin(message.from_user.id):
         await state.clear()
         return
-
     try:
         amount = int(message.text.strip())
         if amount <= 0:
@@ -602,17 +699,194 @@ async def adm_grant_amount(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введи положительное число.")
         return
-
     data = await state.get_data()
     tid = data["target_id"]
     await grant_balance(tid, amount)
     bal = await get_balance(tid)
     await message.answer(
-        f"✅ <b>Начислено {amount}⭐</b>\n"
-        f"Новый баланс пользователя: {bal}⭐",
+        f"✅ <b>Начислено {amount}⭐</b>\nНовый баланс: {bal}⭐",
         reply_markup=kb.ADMIN,
     )
     await state.clear()
+
+
+@router.callback_query(F.data == "adm:ban")
+async def adm_ban(cb: CallbackQuery, state: FSMContext):
+    if not _is_admin(cb.from_user.id):
+        return
+    await state.set_state(AdminBan.waiting_id)
+    await _ed(cb, "🚫 <b>Бан/разбан</b>\n\nОтправь Telegram ID:", kb.CANCEL)
+
+
+@router.message(AdminBan.waiting_id, F.text)
+async def adm_ban_id(message: Message, state: FSMContext):
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        tid = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введи числовой ID.")
+        return
+    u = await find_user_by_id(tid)
+    if not u:
+        await message.answer("❌ Пользователь не найден.", reply_markup=kb.ADMIN)
+        await state.clear()
+        return
+    new_state = not bool(u.get("is_banned"))
+    await ban_user(tid, new_state)
+    status = "забанен 🚫" if new_state else "разбанен ✅"
+    name = html.escape(u.get("first_name") or str(tid))
+    await message.answer(f"<b>{name}</b> — {status}", reply_markup=kb.ADMIN)
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("adm:bn:"))
+async def adm_ban_quick(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        return
+    tid = int(cb.data.split(":")[2])
+    u = await find_user_by_id(tid)
+    if not u:
+        await cb.answer("Не найден")
+        return
+    new_state = not bool(u.get("is_banned"))
+    await ban_user(tid, new_state)
+    status = "забанен 🚫" if new_state else "разбанен ✅"
+    await cb.answer(f"{status}")
+    await cb.message.edit_text(
+        _user_card(await find_user_by_id(tid)),
+        reply_markup=kb.user_card_kb(tid, new_state),
+    )
+
+
+# ── Admin: Promos ──
+
+@router.callback_query(F.data == "adm:promos")
+async def adm_promos(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        return
+    promos = await get_promos(active_only=False)
+    if not promos:
+        text = "🎟 <b>Промокоды</b>\n\nПока нет промокодов."
+    else:
+        lines = ["🎟 <b>Промокоды</b>\n"]
+        for p in promos[:15]:
+            status = "✅" if p["used_count"] < p["max_uses"] else "❌"
+            lines.append(
+                f"{status} <code>{p['code']}</code> — {p['stars']}⭐ "
+                f"({p['used_count']}/{p['max_uses']})"
+            )
+        text = "\n".join(lines)
+
+    from aiogram.types import InlineKeyboardMarkup as IKM, InlineKeyboardButton as IKB
+    await _ed(cb, text, IKM(inline_keyboard=[
+        [IKB(text="➕ Создать промокод", callback_data="adm:promo_new")],
+        [IKB(text="◀️ Админ", callback_data="adm:panel")],
+    ]))
+
+
+@router.callback_query(F.data == "adm:promo_new")
+async def adm_promo_new(cb: CallbackQuery, state: FSMContext):
+    if not _is_admin(cb.from_user.id):
+        return
+    await state.set_state(AdminPromo.waiting_code)
+    await _ed(cb, (
+        "🎟 <b>Новый промокод</b>\n\n"
+        "Введи код (латиница, цифры):"
+    ), kb.CANCEL)
+
+
+@router.message(AdminPromo.waiting_code, F.text)
+async def adm_promo_code(message: Message, state: FSMContext):
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    code = message.text.strip().upper()
+    if not code.isalnum() or len(code) < 3:
+        await message.answer("❌ Код должен быть 3+ символов (A-Z, 0-9).")
+        return
+    await state.update_data(promo_code=code)
+    await state.set_state(AdminPromo.waiting_stars)
+    await message.answer(f"Код: <code>{code}</code>\n\nСколько звёзд начислять?", reply_markup=kb.CANCEL)
+
+
+@router.message(AdminPromo.waiting_stars, F.text)
+async def adm_promo_stars(message: Message, state: FSMContext):
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        stars = int(message.text.strip())
+        if stars <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи положительное число.")
+        return
+    await state.update_data(promo_stars=stars)
+    await state.set_state(AdminPromo.waiting_uses)
+    await message.answer(
+        f"Звёзд: <b>{stars}⭐</b>\n\n"
+        f"Макс. использований (число или 0 = безлимит):",
+        reply_markup=kb.CANCEL,
+    )
+
+
+@router.message(AdminPromo.waiting_uses, F.text)
+async def adm_promo_uses(message: Message, state: FSMContext):
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        uses = int(message.text.strip())
+        if uses < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи число >= 0.")
+        return
+    data = await state.get_data()
+    code = data["promo_code"]
+    stars = data["promo_stars"]
+    max_uses = uses if uses > 0 else 999999
+    ok = await create_promo(code, stars, max_uses, created_by=message.from_user.id)
+    if ok:
+        uses_text = f"{max_uses}" if uses > 0 else "безлимит"
+        await message.answer(
+            f"✅ <b>Промокод создан!</b>\n\n"
+            f"Код: <code>{code}</code>\n"
+            f"Звёзды: <b>{stars}⭐</b>\n"
+            f"Использований: <b>{uses_text}</b>",
+            reply_markup=kb.ADMIN,
+        )
+    else:
+        await message.answer("❌ Такой код уже существует.", reply_markup=kb.ADMIN)
+    await state.clear()
+
+
+# ── Admin: Notifications ──
+
+@router.callback_query(F.data == "adm:notify")
+async def adm_notify(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        return
+    s = await get_notify_settings()
+    await _ed(cb, (
+        "🔔 <b>Уведомления</b>\n\n"
+        "Включи/выключи уведомления для каждого типа событий.\n"
+        "Уведомления приходят в этот чат."
+    ), kb.notify_settings_kb(s))
+
+
+@router.callback_query(F.data.startswith("adm:ntg:"))
+async def adm_notify_toggle(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        return
+    event = cb.data.split(":")[2]
+    new_state = await toggle_notify(event)
+    s = await get_notify_settings()
+    await cb.message.edit_reply_markup(reply_markup=kb.notify_settings_kb(s))
+    status = "включены ✅" if new_state else "выключены 🔴"
+    await cb.answer(f"Уведомления {status}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -636,23 +910,47 @@ def _welcome(u: dict) -> str:
         f"{greeting}\n\n"
         f"🖼 Генерация и редактирование фото\n"
         f"🎥 Создание видео из текста и фото\n"
-        f"🎬 AI-монтаж клипов из геймплея\n"
         f"🛠 Удаление фона, апскейл и другое\n\n"
-        f"💰 Баланс: <b>{u['balance']} ⭐</b>"
+        f"💰 Баланс: <b>{u['balance']}⭐</b>\n"
+        f"🎟 Есть промокод? → /promo КОД"
     )
 
 
 def _admin_text(s: dict) -> str:
+    tools_text = ""
+    if s.get("top_tools"):
+        tools_lines = [f"  · {t}: {c}" for t, c in s["top_tools"].items()]
+        tools_text = "\n🔧 Популярные инструменты:\n" + "\n".join(tools_lines)
+
     return (
         f"🔐 <b>Админ-панель</b>\n\n"
-        f"👥 Пользователей: <b>{s['users']}</b> (+{s['today']} сегодня)\n"
-        f"🎯 Генераций: <b>{s['gens']}</b>\n"
-        f"💰 Доход: <b>{s['revenue']} ⭐</b>"
+        f"👥 Пользователей: <b>{s['users']}</b> (+{s['today_users']} сегодня)\n"
+        f"🟢 Активных (24ч): <b>{s['active_24h']}</b>\n"
+        f"🎯 Генераций: <b>{s['gens']}</b> (+{s['today_gens']} сегодня)\n"
+        f"💰 Доход: <b>{s['revenue']}⭐</b> (+{s['today_revenue']} сегодня)"
+        f"{tools_text}"
+    )
+
+
+def _user_card(u: dict) -> str:
+    name = html.escape(u.get("first_name") or "")
+    uname = html.escape(u.get("username") or "-")
+    banned = " 🚫 ЗАБАНЕН" if u.get("is_banned") else ""
+    return (
+        f"👤 <b>Пользователь</b>{banned}\n\n"
+        f"ID: <code>{u['tg_id']}</code>\n"
+        f"Имя: {name}\n"
+        f"Username: @{uname}\n"
+        f"💰 Баланс: <b>{u['balance']}⭐</b>\n"
+        f"🎯 Генераций: {u['total_gens']}\n"
+        f"💸 Потрачено: {u['total_spent']}⭐\n"
+        f"👥 Заработано рефералами: {u.get('ref_earnings', 0)}⭐\n"
+        f"📅 Регистрация: {str(u['created_at'])[:10]}\n"
+        f"🕐 Последняя активность: {str(u.get('last_active') or '-')[:16]}"
     )
 
 
 async def _ed(cb: CallbackQuery, text: str, markup):
-    """Edit message or send new if edit fails."""
     try:
         await cb.message.edit_text(text, reply_markup=markup)
     except Exception:

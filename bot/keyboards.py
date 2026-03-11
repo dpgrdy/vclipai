@@ -1,4 +1,4 @@
-"""Inline keyboards — 2-level menu, clean navigation."""
+"""Inline keyboards — menu, navigation, admin."""
 
 from aiogram.types import InlineKeyboardMarkup as IKM, InlineKeyboardButton as IKB
 
@@ -12,8 +12,7 @@ def _b(text, data):
 MAIN = IKM(inline_keyboard=[
     [_b("🖼 Фото", "cat:photo"),
      _b("🎥 Видео", "cat:video")],
-    [_b("🛠 Инструменты", "cat:tools"),
-     _b("🎬 Клипы", "tool:clip")],
+    [_b("🛠 Инструменты", "cat:tools")],
     [_b("👤 Профиль", "p:profile"),
      _b("💰 Пополнить", "p:topup"),
      _b("⚙️", "p:settings")],
@@ -45,7 +44,8 @@ TOOLS = IKM(inline_keyboard=[
 PROFILE = IKM(inline_keyboard=[
     [_b("💰 Пополнить", "p:topup"),
      _b("📊 История", "p:history")],
-    [_b("🤝 Пригласить друга · +3⭐", "p:referral")],
+    [_b("🤝 Пригласить друга", "p:referral")],
+    [_b("🎟 Промокод", "p:promo")],
     [_b("◀️ Назад", "nav:main")],
 ])
 
@@ -88,32 +88,9 @@ def settings_kb(cur: str) -> IKM:
     rows.append([_b("◀️ Назад", "nav:main")])
     return IKM(inline_keyboard=rows)
 
-# ━━━━━━━━━━━━ MONTAGE ━━━━━━━━━━━━
-
-def montage_settings_kb(fx: dict, txt: bool) -> IKM:
-    def t(label, key, on):
-        return _b(f"{'✅' if on else '◻️'} {label}", f"eff:{key}")
-    return IKM(inline_keyboard=[
-        [t("Zoom", "zoom", fx.get("zoom", True)),
-         t("SlowMo", "slowmo", fx.get("slowmo", True)),
-         t("Shake", "shake", fx.get("shake", False))],
-        [t("Подписи", "text", txt)],
-        [_b("🎵 Музыка", "mt:music"),
-         _b("🔇 Без", "mt:nomusic")],
-        [_b("🎬 Монтировать", "mt:go")],
-        [_b("❌ Отмена", "mt:cancel")],
-    ])
-
-def moments_kb(n: int) -> IKM:
-    return IKM(inline_keyboard=[
-        [_b(f"✅ Смонтировать {n} моментов", "mt:settings")],
-        [_b("❌ Отмена", "mt:cancel")],
-    ])
-
 # ━━━━━━━━━━━━ RESULT — after tool completion ━━━━━━━━━━━━
 
 def result_kb(tool_cb: str) -> IKM:
-    """Result screen: repeat + menu."""
     return IKM(inline_keyboard=[
         [_b("🔄 Ещё раз", tool_cb),
          _b("◀️ Меню", "nav:main")],
@@ -123,7 +100,8 @@ def result_kb(tool_cb: str) -> IKM:
 
 LOW_BALANCE = IKM(inline_keyboard=[
     [_b("💰 Пополнить", "p:topup"),
-     _b("◀️ Меню", "nav:main")],
+     _b("🤝 Пригласить друга", "p:referral")],
+    [_b("◀️ Меню", "nav:main")],
 ])
 
 # ━━━━━━━━━━━━ COMMON ━━━━━━━━━━━━
@@ -132,10 +110,47 @@ BACK = IKM(inline_keyboard=[[_b("◀️ Меню", "nav:main")]])
 
 CANCEL = IKM(inline_keyboard=[[_b("❌ Отмена", "nav:main")]])
 
+# ━━━━━━━━━━━━ ADMIN ━━━━━━━━━━━━
+
 ADMIN = IKM(inline_keyboard=[
-    [_b("📊 Статистика", "adm:stats")],
-    [_b("📢 Рассылка", "adm:broadcast")],
-    [_b("👤 Юзер", "adm:user"),
-     _b("💰 Начислить", "adm:grant")],
+    [_b("📊 Статистика", "adm:stats"),
+     _b("📋 Логи", "adm:logs")],
+    [_b("📢 Рассылка", "adm:broadcast"),
+     _b("👤 Юзер", "adm:user")],
+    [_b("💰 Начислить", "adm:grant"),
+     _b("🚫 Бан", "adm:ban")],
+    [_b("🎟 Промокоды", "adm:promos"),
+     _b("🔔 Уведомления", "adm:notify")],
     [_b("◀️ Назад", "nav:main")],
 ])
+
+ADMIN_BACK = IKM(inline_keyboard=[[_b("◀️ Админ", "adm:panel")]])
+
+
+def notify_settings_kb(settings: dict) -> IKM:
+    labels = {
+        "new_user": "👤 Новый юзер",
+        "payment": "💰 Оплата",
+        "tool_use": "🔧 Инструменты",
+        "error": "❌ Ошибки",
+        "referral": "🤝 Рефералы",
+        "promo": "🎟 Промокоды",
+    }
+    rows = []
+    for event, label in labels.items():
+        on = settings.get(event, False)
+        rows.append([IKB(
+            text=f"{'🟢' if on else '🔴'} {label}",
+            callback_data=f"adm:ntg:{event}",
+        )])
+    rows.append([_b("◀️ Админ", "adm:panel")])
+    return IKM(inline_keyboard=rows)
+
+
+def user_card_kb(tg_id: int, is_banned: bool) -> IKM:
+    ban_text = "✅ Разбанить" if is_banned else "🚫 Забанить"
+    return IKM(inline_keyboard=[
+        [_b("💰 Начислить", f"adm:gr:{tg_id}"),
+         _b(ban_text, f"adm:bn:{tg_id}")],
+        [_b("◀️ Админ", "adm:panel")],
+    ])

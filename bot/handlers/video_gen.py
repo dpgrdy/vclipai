@@ -12,6 +12,7 @@ from bot.keyboards import BACK, LOW_BALANCE, result_kb
 from bot.progress import Progress
 from db import get_balance, spend, topup
 from core.video_gen import generate_video_from_text, generate_video_from_image
+from bot.services.notifier import notify
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ async def on_text(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return
 
+    await notify("tool_use", f"Текст→Видео: {prompt[:50]}", tg_id=tg_id, tool="vid_text")
     bal = await get_balance(tg_id)
     await bot.send_video(
         chat_id=message.chat.id, video=FSInputFile(result),
@@ -104,6 +106,7 @@ async def on_img(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return
 
+    await notify("tool_use", f"Фото→Видео: {caption[:50]}", tg_id=tg_id, tool="vid_img")
     bal = await get_balance(tg_id)
     await bot.send_video(
         chat_id=message.chat.id, video=FSInputFile(result),
