@@ -1,4 +1,4 @@
-"""Video editor pipeline — cut, effects, text, music, export."""
+"""Video editor — segment-based editing with point effects."""
 
 import logging
 from dataclasses import dataclass, field
@@ -7,122 +7,110 @@ from pathlib import Path
 from moviepy import VideoFileClip, concatenate_videoclips
 
 from config import settings
-from core.effects import apply_zoom, apply_slowmo, apply_shake, crossfade_clips
-from core.text_overlay import add_text_to_clip
+from core.effects import apply_zoom, apply_slowmo, apply_shake, apply_speedup
 from core.music import overlay_music
 
 log = logging.getLogger(__name__)
-
-# Types that benefit from slowmo (dramatic effect)
-SLOWMO_TYPES = {"kill", "clutch", "hit", "dodge"}
-# Types that benefit from shake (impact feel)
-SHAKE_TYPES = {"kill", "hit", "clutch"}
 
 
 @dataclass
 class MontageSettings:
     effects: dict = field(default_factory=lambda: {
-        "zoom": True, "slowmo": True, "shake": False
+        "zoom": True, "slowmo": True, "shake": True
     })
     text_on: bool = True
     music_path: str | None = None
+    crop_vertical: bool = True
 
 
 def process_video(
     video_path: str,
-    moments: list[dict],
+    edit_data: dict,
     montage_settings: MontageSettings,
 ) -> Path:
-    """Main processing pipeline. Runs in a thread (blocking)."""
-    log.info("Starting montage: %d moments, effects=%s", len(moments), montage_settings.effects)
+    """Segment-based editor: extract continuous segments, apply point effects."""
+    segments = edit_data.get("segments", [])
+    effects = edit_data.get("effects", [])
+
+    log.info("Starting montage: %d segments, %d effects", len(segments), len(effects))
 
     source = VideoFileClip(video_path)
     duration = source.duration
     source_fps = source.fps or 30
 
-    # Filter out moments beyond video duration and cap at 30
-    moments = [m for m in moments if m["start_sec"] < duration]
-    if len(moments) > 30:
-        # Keep top 30 by intensity
-        moments.sort(key=lambda x: x.get("intensity", 5), reverse=True)
-        moments = moments[:30]
-        moments.sort(key=lambda x: x["start_sec"])
-    log.info("After filtering: %d moments (video duration: %.1fs)", len(moments), duration)
+    # Filter segments beyond video duration
+    segments = [s for s in segments if s["start"] < duration]
+    for s in segments:
+        s["end"] = min(s["end"], duration)
 
-    # Extract clips for each moment
+    log.info("After filtering: %d segments (video: %.1fs)", len(segments), duration)
+
+    if not segments:
+        source.close()
+        raise ValueError("No valid segments")
+
+    # Build effect lookup: which effects fall within which segment
+    def effects_in_range(start, end):
+        return [e for e in effects if start <= e["at"] < end]
+
     clips = []
-    for m in moments:
-        start = max(0, m["start_sec"])
-        end = min(duration, m["end_sec"])
-        if end <= start:
+    for seg in segments:
+        seg_start = max(0, seg["start"])
+        seg_end = seg["end"]
+        if seg_end <= seg_start or (seg_end - seg_start) < 0.3:
             continue
 
-        clip = source.subclipped(start, end)
-        intensity = m.get("intensity", 5)
-        mtype = m.get("moment_type", "other")
+        seg_effects = effects_in_range(seg_start, seg_end)
 
-        # Smart effects based on moment type + intensity
-        if montage_settings.effects.get("zoom"):
-            # Stronger zoom on high-intensity moments
-            clip = apply_zoom(clip, intensity)
-
-        if montage_settings.effects.get("slowmo"):
-            # Slowmo only on dramatic moments with high intensity
-            if mtype in SLOWMO_TYPES and intensity >= 7:
-                clip = apply_slowmo(clip, factor=0.4)
-            elif intensity >= 9:
-                # Epic moments always get slowmo
-                clip = apply_slowmo(clip, factor=0.5)
-
-        if montage_settings.effects.get("shake"):
-            if mtype in SHAKE_TYPES and intensity >= 5:
-                clip = apply_shake(clip, intensity)
-
-        # Text overlay
-        if montage_settings.text_on and m.get("description"):
-            clip = add_text_to_clip(clip, m["description"])
-
-        clips.append(clip)
+        if not seg_effects or not montage_settings.effects.get("zoom"):
+            # No effects in this segment — extract as one continuous clip
+            clip = source.subclipped(seg_start, seg_end)
+            clips.append(clip)
+        else:
+            # Split segment around effect points
+            sub_clips = _apply_point_effects(
+                source, seg_start, seg_end, seg_effects, montage_settings
+            )
+            clips.extend(sub_clips)
 
     if not clips:
         source.close()
         raise ValueError("No valid clips extracted")
 
-    # Crop to vertical 9:16 for TikTok
-    clips = [_crop_vertical(c) for c in clips]
+    # Crop to 9:16 if needed
+    if montage_settings.crop_vertical:
+        clips = [_crop_vertical(c) for c in clips]
+    else:
+        clips = [_ensure_even(c) for c in clips]
 
-    # Concatenate with transitions
-    final = crossfade_clips(clips, fade_duration=0.3)
+    # Concatenate — hard cuts
+    final = concatenate_videoclips(clips, method="compose")
 
-    # Overlay music
     if montage_settings.music_path:
         final = overlay_music(final, montage_settings.music_path)
 
-    # Export — TikTok optimal: 1080x1920, h264, 30fps, high bitrate
     output_path = settings.temp_dir / f"montage_{Path(video_path).stem}.mp4"
-    log.info("Exporting to %s", output_path)
+    log.info("Exporting to %s (%.1fs)", output_path, final.duration)
 
-    # Use source fps capped at 60
-    out_fps = min(source_fps, 60)
+    out_fps = min(source_fps, 30)
 
     final.write_videofile(
         str(output_path),
         codec="libx264",
         audio_codec="aac",
-        audio_bitrate="192k",
+        audio_bitrate="128k",
         fps=out_fps,
-        preset="medium",  # better quality than "fast"
-        bitrate="10000k",  # high quality for TikTok
+        preset="fast",
         ffmpeg_params=[
-            "-pix_fmt", "yuv420p",    # max compatibility
-            "-movflags", "+faststart", # streaming-friendly
-            "-profile:v", "high",      # h264 high profile
+            "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-profile:v", "high",
             "-level", "4.1",
         ],
         logger=None,
     )
 
-    # Cleanup
     source.close()
     for c in clips:
         try:
@@ -130,37 +118,69 @@ def process_video(
         except Exception:
             pass
 
-    log.info("Montage complete: %s (%.1fMB)", output_path,
-             output_path.stat().st_size / 1024 / 1024)
+    size_mb = output_path.stat().st_size / 1024 / 1024
+    log.info("Montage complete: %s (%.1fMB, %.1fs)", output_path, size_mb, final.duration)
     return output_path
 
 
-def _crop_vertical(clip) -> object:
-    """Crop horizontal video to 9:16 vertical (center crop). Ensures even dimensions for h264."""
+def _apply_point_effects(source, seg_start, seg_end, effects, settings):
+    """Split a segment around effect points and apply effects."""
+    clips = []
+    cursor = seg_start
+
+    for fx in sorted(effects, key=lambda e: e["at"]):
+        fx_start = max(seg_start, fx["at"] - 0.3)  # 0.3s before
+        fx_end = min(seg_end, fx["at"] + fx["duration"])
+        fx_type = fx["type"]
+
+        # Before the effect — normal clip
+        if cursor < fx_start:
+            clips.append(source.subclipped(cursor, fx_start))
+
+        # The effect clip
+        if fx_start < fx_end:
+            fx_clip = source.subclipped(fx_start, fx_end)
+
+            if fx_type == "zoom_slowmo" and settings.effects.get("slowmo"):
+                fx_clip = apply_zoom(fx_clip, zoom_level=1.6)
+                fx_clip = apply_slowmo(fx_clip, factor=0.5)
+            elif fx_type == "shake" and settings.effects.get("shake"):
+                fx_clip = apply_shake(fx_clip, intensity=8)
+                fx_clip = apply_slowmo(fx_clip, factor=0.7)
+            elif fx_type == "speedup":
+                fx_clip = apply_speedup(fx_clip, factor=1.5)
+
+            clips.append(fx_clip)
+
+        cursor = fx_end
+
+    # After last effect — rest of segment
+    if cursor < seg_end:
+        clips.append(source.subclipped(cursor, seg_end))
+
+    return clips
+
+
+def _crop_vertical(clip):
+    """Crop to 9:16. Even dimensions."""
     w, h = clip.size
     target_ratio = 9 / 16
-
     current_ratio = w / h
     if abs(current_ratio - target_ratio) < 0.05:
-        # Already roughly vertical — just ensure even dimensions
         return _ensure_even(clip)
-
     if current_ratio > target_ratio:
-        # Wider than 9:16 — crop sides
         new_w = int(h * target_ratio)
-        new_w = new_w - (new_w % 2)  # ensure even
+        new_w = new_w - (new_w % 2)
         x1 = (w - new_w) // 2
         return clip.cropped(x1=x1, x2=x1 + new_w)
     else:
-        # Taller than 9:16 — crop top/bottom
         new_h = int(w / target_ratio)
-        new_h = new_h - (new_h % 2)  # ensure even
+        new_h = new_h - (new_h % 2)
         y1 = (h - new_h) // 2
         return clip.cropped(y1=y1, y2=y1 + new_h)
 
 
-def _ensure_even(clip) -> object:
-    """Ensure clip has even width and height (h264 requirement)."""
+def _ensure_even(clip):
     w, h = clip.size
     new_w = w - (w % 2)
     new_h = h - (h % 2)

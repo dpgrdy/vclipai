@@ -25,7 +25,7 @@ COST = 3
 
 TG_DOWNLOAD_LIMIT_MB = 20
 ANALYSIS_TIMEOUT = 600
-MONTAGE_TIMEOUT = 600
+MONTAGE_TIMEOUT = 900
 
 
 def _is_video_document(message: Message) -> bool:
@@ -154,23 +154,8 @@ async def _handle_video(message: Message, state: FSMContext, bot: Bot):
         "1-3 мин",
     ):
         try:
-            moments = await asyncio.wait_for(
-                analyze_video(str(video_path), caption),
-                timeout=ANALYSIS_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            log.error("Gemini analysis timed out")
-            await topup(tg_id, COST, "Возврат: таймаут анализа")
-            bal = await get_balance(tg_id)
-            await status_msg.edit_text(
-                f"❌ Анализ занял больше 2 минут и был прерван.\n"
-                f"Попробуй видео покороче.\n\n"
-                f"💰 {bal}⭐ (звёзды возвращены)",
-                reply_markup=BACK,
-            )
-            await state.clear()
-            _cleanup(video_path)
-            return
+            edit_data = await analyze_video(str(video_path), caption)
+            moments = edit_data.get("segments", [])
         except Exception as e:
             log.error("Gemini analysis failed: %s", e)
             await topup(tg_id, COST, "Возврат: ошибка анализа")
@@ -202,16 +187,19 @@ async def _handle_video(message: Message, state: FSMContext, bot: Bot):
         _cleanup(video_path)
         return
 
-    # Show moments
+    n_effects = len(edit_data.get("effects", []))
+
+    # Show segments
     preview_lines = [
-        f"🎯 <b>Найдено {len(moments)} моментов</b>"
+        f"🎯 <b>Найдено {len(moments)} сегментов, {n_effects} эффектов</b>"
         f" <i>(анализ: {t_analyze} сек)</i>\n",
     ]
     for i, m in enumerate(moments, 1):
-        start_ts = _fmt_time(m["start_sec"])
-        end_ts = _fmt_time(m["end_sec"])
-        desc = m.get("description", "")
-        preview_lines.append(f"{i}. {start_ts}–{end_ts} — {desc}")
+        start_ts = _fmt_time(m["start"])
+        end_ts = _fmt_time(m["end"])
+        note = m.get("note", m.get("description", ""))
+        seg_type = m.get("type", "action")
+        preview_lines.append(f"{i}. [{seg_type}] {start_ts}–{end_ts} — {note}")
 
     await status_msg.edit_text(
         "\n".join(preview_lines),
@@ -221,6 +209,7 @@ async def _handle_video(message: Message, state: FSMContext, bot: Bot):
     await state.update_data(
         video_path=str(video_path),
         instruction=caption,
+        edit_data=edit_data,
         moments=moments,
         effects=DEFAULT_EFFECTS.copy(),
         text_on=True,
@@ -321,21 +310,10 @@ async def on_go(callback: CallbackQuery, state: FSMContext, bot: Bot):
         "1-3 мин",
     ):
         try:
-            result_path = await asyncio.wait_for(
-                asyncio.to_thread(process_video, video_path, moments, montage_settings),
-                timeout=MONTAGE_TIMEOUT,
+            edit_data = data.get("edit_data", {"segments": moments, "effects": []})
+            result_path = await asyncio.to_thread(
+                process_video, video_path, edit_data, montage_settings,
             )
-        except asyncio.TimeoutError:
-            log.error("Montage timed out")
-            elapsed = int(time.monotonic() - t0)
-            await callback.message.edit_text(
-                f"❌ Монтаж прерван — занял больше 5 минут ({elapsed} сек).\n"
-                f"Попробуй меньше моментов или видео покороче.",
-                reply_markup=BACK,
-            )
-            _cleanup(Path(video_path))
-            await state.clear()
-            return
         except Exception as e:
             log.error("Montage failed: %s", e, exc_info=True)
             elapsed = int(time.monotonic() - t0)
@@ -364,6 +342,7 @@ async def on_go(callback: CallbackQuery, state: FSMContext, bot: Bot):
         ),
         reply_markup=result_kb("tool:clip"),
         supports_streaming=True,
+        request_timeout=300,
     )
 
     _cleanup(Path(video_path))
