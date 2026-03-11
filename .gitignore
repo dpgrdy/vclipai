@@ -1,0 +1,11 @@
+.env
+temp/
+__pycache__/
+*.pyc
+.venv/
+data/
+bot-api-data/
+bot.log
+bot_output.log
+nohup.out
+*.mp4
